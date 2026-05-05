@@ -397,6 +397,17 @@ class GameSession:
         if not lines:
             return
 
+        # Bail out on failed movement — don't add junk rooms or break directionality
+        FAILED_MOVE_PHRASES = (
+            "you can't go that way", "you can't go there",
+            "that way is blocked", "there is no exit",
+            "you cannot go", "that's not a direction",
+            "you bump into", "there's no way",
+        )
+        first_lower = lines[0].lower()
+        if direction and any(p in first_lower for p in FAILED_MOVE_PHRASES):
+            return
+
         room_name = lines[0]
         description = ""
         for ln in lines[1:]:
