@@ -403,6 +403,7 @@ class GameSession:
             "that way is blocked", "there is no exit",
             "you cannot go", "that's not a direction",
             "you bump into", "there's no way",
+            "certain death",
         )
         first_lower = lines[0].lower()
         if direction and any(p in first_lower for p in FAILED_MOVE_PHRASES):
