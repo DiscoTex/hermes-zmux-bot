@@ -1,6 +1,8 @@
-# Hermes Z-Machine Discord Bot
+# Z-Machine Discord Bot
 
 A Discord bot that drives [dfrotz](https://gitlab.com/DavidGriffith/frotz) to play Infocom-style Z-machine interactive fiction games in Discord channels.
+
+This code was made entirely hands-off by a Hermes bot using various models.
 
 ## Features
 
