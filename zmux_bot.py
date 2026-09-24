@@ -11,6 +11,7 @@ Game output is posted verbatim inside a code block. Mapper commands:
 """
 
 import asyncio
+import io
 import json
 import os
 import re
@@ -18,6 +19,8 @@ import shutil
 import sys
 from collections import deque
 from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
 
 import discord
 
@@ -51,6 +54,17 @@ def dfrotz_cmd(game_path: Path) -> list[str]:
 
 PROMPT_RE = re.compile(r"(?m)^\s*>\s*$")
 
+# Detect "Exits:" / "Obvious exits:" lines in game output
+EXITS_LINE_RE = re.compile(
+    r"^(?:Obvious exits?|Exits?)\s*:\s*(.+?)\.?\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Individual direction words inside the exits list
+DIR_WORD_RE = re.compile(
+    r"\b(north|south|east|west|northeast|northwest|southeast|southwest|up|down)\b",
+    re.IGNORECASE,
+)
+
 # ---------- MAPPER ----------
 class Room:
     def __init__(self, name: str, description: str):
@@ -63,6 +77,54 @@ class GameMap:
         self.rooms: dict[str, Room] = {}
         self.start: str | None = None
         self.here: str | None = None
+        self.pending: set[str] = {}   # temp-named rooms waiting for real name
+        self._temp_counter: int = 0
+
+    def _next_temp_name(self) -> str:
+        import string
+        # Generate RoomA, RoomB, ..., RoomZ, RoomAA, RoomAB, ...
+        letters = string.ascii_uppercase
+        n = self._temp_counter
+        self._temp_counter += 1
+        name = ""
+        while True:
+            name = letters[n % 26] + name
+            n = n // 26 - 1
+            if n < 0:
+                break
+        return "Room" + name
+
+    def rename_room(self, old_name: str, new_name: str):
+        """Rename a room in-place, updating all exit references."""
+        if old_name not in self.rooms or old_name == new_name:
+            return
+        room = self.rooms.pop(old_name)
+        room.name = new_name
+        self.rooms[new_name] = room
+        # Update all exit references pointing to old_name
+        for r in self.rooms.values():
+            for d, dst in list(r.exits.items()):
+                if dst == old_name:
+                    r.exits[d] = new_name
+        if self.here == old_name:
+            self.here = new_name
+        if self.start == old_name:
+            self.start = new_name
+        if old_name in self.pending:
+            self.pending.discard(old_name)
+            self.pending.add(new_name)
+
+    def mark_temp(self, query: str) -> list[str]:
+        """Rename rooms matching query to RoomA/B/... and mark pending."""
+        q = query.lower()
+        targets = [n for n in list(self.rooms) if q in n.lower()]
+        renamed = []
+        for name in targets:
+            temp = self._next_temp_name()
+            self.rename_room(name, temp)
+            self.pending.add(temp)
+            renamed.append(f"{name} → {temp}")
+        return renamed
 
     def add_room(self, name: str, description: str) -> "Room":
         if name not in self.rooms:
@@ -86,113 +148,198 @@ class GameMap:
             for room in self.rooms.values():
                 room.exits = {d: dst for d, dst in room.exits.items() if dst != name}
             if self.here == name:
-                self.here = self.start
+                self.here = None
             if self.start == name:
                 self.start = next(iter(self.rooms), None)
         if targets:
             pass  # caller is responsible for saving the map
         return targets
 
-    def to_ascii(self) -> str:
+    def to_image(self) -> bytes | None:
+        """Render the map as a PNG (bytes). Returns None if no data yet."""
         if not self.start or self.start not in self.rooms:
-            return "(no map data yet)"
+            return None
 
-        # Direction -> (dx, dy, dz): up/down get their own z-layer
-        DIR_DELTA: dict[str, tuple[int, int, int]] = {
-            "north": (0, -1, 0), "south": (0,  1, 0),
-            "west":  (-1, 0, 0), "east":  (1,  0, 0),
-            "up":    (0,  0,  1), "down":  (0,  0, -1),
-            "northeast": (1, -1, 0), "northwest": (-1, -1, 0),
-            "southeast": (1,  1, 0), "southwest": (-1,  1, 0),
-        }
-        DIR_CONN: dict[tuple[int, int], str] = {
-            (0, -1): " │ ", (0,  1): " │ ",
-            (1, -1): " ╱ ", (-1, -1): " ╲ ",
-            (1,  1): " ╲ ", (-1,  1): " ╱ ",
-        }
+        def is_real_room(name: str) -> bool:
+            if len(name) > 30: return False
+            if any(c in name for c in ('"', '[', '/', '.', "'", '!')): return False
+            if not name[0].isupper(): return False
+            return True
 
-        # BFS tracking (x, y, z)
-        pos3: dict[str, tuple[int, int, int]] = {self.start: (0, 0, 0)}
-        q = deque([self.start])
+        destinations: set[str] = set()
+        for info in self.rooms.values():
+            destinations.update(info.exits.values())
+        real_rooms = {k: v for k, v in self.rooms.items()
+                      if is_real_room(k) and (k in destinations or v.exits)}
+
+        GRID_DELTA = {
+            "north":     (0,  1), "south":     (0, -1),
+            "east":      (1,  0), "west":      (-1, 0),
+            "northeast": (1,  1), "northwest": (-1, 1),
+            "southeast": (1, -1), "southwest": (-1,-1),
+            "up":        (0,  3), "down":      (0, -3),
+        }
+        SHORT = {"north":"N","south":"S","east":"E","west":"W",
+                 "up":"U","down":"D","northeast":"NE","northwest":"NW",
+                 "southeast":"SE","southwest":"SW"}
+
+        root = self.start if self.start in real_rooms else (next(iter(real_rooms)) if real_rooms else None)
+        if not root:
+            return None
+
+        grid: dict[str, tuple[int, int]] = {root: (0, 0)}
+        occupied: dict[tuple[int, int], str] = {(0, 0): root}
+        q: deque[str] = deque([root])
         while q:
             cur = q.popleft()
-            cx, cy, cz = pos3[cur]
-            for d, dst in self.rooms[cur].exits.items():
-                if dst not in pos3:
-                    dx, dy, dz = DIR_DELTA.get(d, (0, 0, 0))
-                    pos3[dst] = (cx + dx, cy + dy, cz + dz)
-                    q.append(dst)
-
-        # Group rooms by floor (z)
-        floors: dict[int, dict[str, tuple[int, int]]] = {}
-        for name, (x, y, z) in pos3.items():
-            floors.setdefault(z, {})[name] = (x, y)
-
-        CELL_W = 11
-        EMPTY = " " * CELL_W
-        layer_chunks: list[str] = []
-
-        for z in sorted(floors.keys(), reverse=True):
-            layer_pos = floors[z]
-            xs = [p[0] for p in layer_pos.values()]
-            ys = [p[1] for p in layer_pos.values()]
-            min_x, max_x = min(xs), max(xs)
-            min_y, max_y = min(ys), max(ys)
-
-            gcols = (max_x - min_x) * 2 + 1
-            grows = (max_y - min_y) * 2 + 1
-            grid = [[EMPTY] * gcols for _ in range(grows)]
-
-            # Place rooms
-            for name, (x, y) in layer_pos.items():
-                gx = (x - min_x) * 2
-                gy = (y - min_y) * 2
-                if self.here == name:
-                    inner = name[: CELL_W - 2]
-                    label = f"[{inner}]"
+            cx, cy = grid[cur]
+            for direction, dst in real_rooms.get(cur, Room("","")).exits.items():
+                if dst not in real_rooms or dst in grid:
+                    continue
+                dx, dy = GRID_DELTA.get(direction, (0, 0))
+                candidate = (cx + dx, cy + dy)
+                # Resolve collision: push rooms in the direction of travel to make space
+                for _attempt in range(50):
+                    if candidate not in occupied or occupied[candidate] == dst:
+                        break
+                    new_grid: dict[str, tuple[int, int]] = {}
+                    new_occ:  dict[tuple[int, int], str] = {}
+                    for rname, (rx, ry) in grid.items():
+                        # Shift rooms that are "ahead" in the direction of travel
+                        nx = rx + (1 if dx > 0 and rx >= candidate[0] else
+                                  -1 if dx < 0 and rx <= candidate[0] else 0)
+                        ny = ry + (1 if dy > 0 and ry >= candidate[1] else
+                                  -1 if dy < 0 and ry <= candidate[1] else 0)
+                        new_grid[rname] = (nx, ny)
+                        new_occ[(nx, ny)] = rname
+                    grid = new_grid
+                    occupied = new_occ
+                    cx, cy = grid[cur]
+                    candidate = (cx + dx, cy + dy)
                 else:
-                    label = name[: CELL_W]
-                grid[gy][gx] = label.center(CELL_W)
-
-            # Place same-floor connectors
-            seen_conns: set[tuple[str, str]] = set()
-            for name, (x, y) in layer_pos.items():
-                for d, dst in self.rooms[name].exits.items():
-                    if dst not in layer_pos:
-                        continue
-                    pair = tuple(sorted([name, dst]))
-                    if pair in seen_conns:
-                        continue
-                    seen_conns.add(pair)  # type: ignore[arg-type]
-
-                    dx, dy, dz = DIR_DELTA.get(d, (0, 0, 0))
-                    if dz != 0:
-                        continue
-                    if layer_pos.get(dst) != (x + dx, y + dy):
-                        continue  # layout conflict
-
-                    cgx = (x - min_x) * 2 + dx
-                    cgy = (y - min_y) * 2 + dy
-                    if not (0 <= cgx < gcols and 0 <= cgy < grows):
-                        continue
-
-                    if dy == 0 and dx != 0:
-                        conn = "─" * CELL_W
+                    # fallback: park it at the far edge in the travel direction
+                    if dx != 0:
+                        fx = (max(x for x, y in grid.values()) + 1) if dx > 0 \
+                             else (min(x for x, y in grid.values()) - 1)
+                        candidate = (fx, cy + dy)
                     else:
-                        conn = DIR_CONN.get((dx, dy), "   ")
-                    grid[cgy][cgx] = conn.center(CELL_W)
+                        fy = (max(y for x, y in grid.values()) + 1) if dy > 0 \
+                             else (min(y for x, y in grid.values()) - 1)
+                        candidate = (cx + dx, fy)
+                grid[dst] = candidate
+                occupied[candidate] = dst
+                q.append(dst)
 
-            lines = ["".join(row).rstrip() for row in grid]
-            floor_label = f"Floor {z:+d}" if z != 0 else "Ground"
-            header = f"── {floor_label} " + "─" * max(0, 30 - len(floor_label))
-            layer_chunks.append(header + "\n" + "\n".join(lines))
+        off = max((x for x, y in grid.values()), default=0) + 3
+        for i, r in enumerate(r for r in real_rooms if r not in grid):
+            grid[r] = (off + i, 0)
 
-        return "\n\n".join(layer_chunks)
+        edges = []
+        seen: set[frozenset[str]] = set()
+        for name, room in real_rooms.items():
+            for direction, dst in room.exits.items():
+                if dst not in real_rooms or dst not in grid or name not in grid:
+                    continue
+                pair: frozenset[str] = frozenset([name, dst])
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                edges.append((name, dst, direction))
+
+        CELL  = 130
+        PAD   = 70
+        BOX_W = 116
+        BOX_H = 38
+        BG         = (35, 39, 42)
+        ROOM_FILL  = (44, 47, 51)
+        ROOM_HERE  = (114, 137, 218)
+        BORDER_COL = (114, 137, 218)
+        EDGE_COL   = (120, 140, 160)
+        TEXT_COL   = (255, 255, 255)
+        LABEL_COL  = (160, 180, 200)
+        UD_COL     = (200, 160, 100)
+
+        xs = [x for x, y in grid.values()]
+        ys = [y for x, y in grid.values()]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+
+        W = (max_x - min_x) * CELL + PAD * 2 + BOX_W
+        H = (max_y - min_y) * CELL + PAD * 2 + BOX_H
+
+        def to_px(gx: int, gy: int) -> tuple[int, int]:
+            x = (gx - min_x) * CELL + PAD + BOX_W // 2
+            y = (max_y - gy) * CELL + PAD + BOX_H // 2
+            return x, y
+
+        img = Image.new("RGB", (W, H), BG)
+        draw = ImageDraw.Draw(img)
+
+        try:
+            font    = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 13)
+            font_sm = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 10)
+        except Exception:
+            font = font_sm = ImageFont.load_default()
+
+        STUB = 18  # px stub length for misaligned connections
+        DIR_VEC = {
+            "north": (0, -1), "south": (0, 1), "east": (1, 0), "west": (-1, 0),
+            "northeast": (1, -1), "northwest": (-1, -1),
+            "southeast": (1, 1), "southwest": (-1, 1),
+            "up": (0, -1), "down": (0, 1),
+        }
+        for src, dst, direction in edges:
+            x1, y1 = to_px(*grid[src])
+            x2, y2 = to_px(*grid[dst])
+            col   = UD_COL if direction in ("up", "down") else EDGE_COL
+            width = 3 if direction in ("up", "down") else 2
+            gx1, gy1 = grid[src]
+            gx2, gy2 = grid[dst]
+            dx, dy = abs(gx2 - gx1), abs(gy2 - gy1)
+            # If rooms are adjacent (1 cell apart), draw a direct line
+            if max(dx, dy) <= 1:
+                draw.line([(x1, y1), (x2, y2)], fill=col, width=width)
+                mx, my = (x1 + x2) // 2, (y1 + y2) // 2
+            else:
+                # Draw an L-shaped route: horizontal then vertical
+                mid = (x2, y1)
+                draw.line([(x1, y1), mid], fill=col, width=width)
+                draw.line([mid, (x2, y2)], fill=col, width=width)
+                mx, my = (x1 + x2) // 2, y1
+            label = SHORT.get(direction, direction)
+            bbox = draw.textbbox((0, 0), label, font=font_sm)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            draw.rectangle([mx - 2, my - 2, mx + tw + 4, my + th + 2], fill=BG)
+            draw.text((mx, my), label, fill=col, font=font_sm)
+
+        for name, (gx, gy) in grid.items():
+            cx, cy = to_px(gx, gy)
+            x0, y0 = cx - BOX_W // 2, cy - BOX_H // 2
+            x1, y1 = cx + BOX_W // 2, cy + BOX_H // 2
+            fill   = ROOM_HERE if name == self.here else ROOM_FILL
+            border = (255, 255, 255) if name == self.here else BORDER_COL
+            bw     = 3 if name == self.here else 2
+            # Temp/pending rooms get an orange dashed-look via a distinct color
+            if name in self.pending:
+                fill   = (80, 50, 20) if name != self.here else ROOM_HERE
+                border = (255, 165, 0)
+                bw     = 2
+            draw.rounded_rectangle([x0, y0, x1, y1], radius=7, fill=fill, outline=border, width=bw)
+            lbl = name if len(name) <= 14 else name[:13] + "…"
+            bbox = draw.textbbox((0, 0), lbl, font=font)
+            tw = bbox[2] - bbox[0]
+            draw.text((cx - tw // 2, cy - 8), lbl, fill=TEXT_COL, font=font)
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
 
     def to_dict(self):
         return {
             "start": self.start,
             "here": self.here,
+            "pending": list(self.pending),
+            "temp_counter": self._temp_counter,
             "rooms": {
                 name: {"description": r.description, "exits": r.exits}
                 for name, r in self.rooms.items()
@@ -204,6 +351,8 @@ class GameMap:
         g = cls()
         g.start = data.get("start")
         g.here = data.get("here")
+        g.pending = set(data.get("pending", []))
+        g._temp_counter = data.get("temp_counter", 0)
         for name, info in data.get("rooms", {}).items():
             r = Room(name, info.get("description", ""))
             r.exits = info.get("exits", {})
@@ -282,15 +431,22 @@ class GameSession:
         # Read startup banner / first prompt
         await self._read_until_prompt(timeout=3.0)
 
-        if restore and self.save_path.is_file():
-            await self._send("restore")
-            await self._read_until_prompt(timeout=2.0)  # filename prompt
-            await self._send(str(self.save_path))
-            await self._read_until_prompt(timeout=2.0)  # "Ok." + next prompt
-            # Sync map location after restore
-            await self._send("look")
-            look_out = await self._read_until_prompt(timeout=3.0)
-            self.update_map(look_out, None)
+        if restore:
+            # Prefer the active named slot over the quicksave
+            if self._active_slot:
+                slot_path = self.named_save_path(self._active_slot)
+                restore_path = slot_path if slot_path.is_file() else self.save_path
+            else:
+                restore_path = self.save_path
+            if restore_path.is_file():
+                await self._send("restore")
+                await self._read_until_prompt(timeout=2.0)  # filename prompt
+                await self._send(str(restore_path))
+                await self._read_until_prompt(timeout=2.0)  # "Ok." + next prompt
+                # Sync map location after restore
+                await self._send("look")
+                look_out = await self._read_until_prompt(timeout=3.0)
+                self.update_map(look_out, None)
 
     async def _send(self, cmd: str):
         assert self.proc and self.proc.stdin
@@ -391,6 +547,15 @@ class GameSession:
         self.update_map(look_output, None)
         return (output + "\n" + look_output).strip() or f"Loaded slot '{slot}'."
 
+    # Opposite directions for bidirectional exit recording
+    OPPOSITE_DIR = {
+        "north": "south", "south": "north",
+        "east": "west",   "west": "east",
+        "up": "down",     "down": "up",
+        "northeast": "southwest", "southwest": "northeast",
+        "northwest": "southeast", "southeast": "northwest",
+    }
+
     def update_map(self, output: str, direction: str | None):
         """Parse output and update the map."""
         lines = [ln.strip() for ln in output.splitlines() if ln.strip()]
@@ -409,7 +574,18 @@ class GameSession:
         if direction and any(p in first_lower for p in FAILED_MOVE_PHRASES):
             return
 
-        room_name = lines[0]
+        # Skip "You travel..." / "You are..." lines to find the actual room name
+        name_line = lines[0]
+        if name_line.lower().startswith("you"):
+            for ln in lines[1:]:
+                if ln and not ln.startswith(">"):
+                    name_line = ln
+                    break
+
+        # Normalize: "Dorm, in the bed" → "Dorm" (sub-location, not a new room)
+        raw_name = name_line
+        room_name = raw_name.split(",")[0].strip()
+
         description = ""
         for ln in lines[1:]:
             if ln and not ln.startswith(">"):
@@ -418,10 +594,30 @@ class GameSession:
 
         current_room = self.game_map.add_room(room_name, description)
 
+        # Auto-correct temp-named room if we've arrived here and know the real name
+        if self.game_map.here and self.game_map.here in self.game_map.pending and direction:
+            # We moved into the pending room — it already exists under its temp name.
+            # But we need to check: did we just land ON the pending room, or are we arriving fresh?
+            pass  # handled below after here is updated
+
         if direction and self.game_map.here:
-            if current_room.name != self.game_map.here:
-                self.game_map.set_exit(self.game_map.here, direction, current_room.name)
-                self.game_map.here = current_room.name
+            prev = self.game_map.here
+            # Check if the room we moved into is a pending temp room
+            temp_name = self.game_map.rooms.get(prev, Room("","")).exits.get(direction)
+            if temp_name and temp_name in self.game_map.pending and temp_name != room_name:
+                # We've arrived at a temp room; real name is room_name — rename it
+                self.game_map.rename_room(temp_name, room_name)
+                self.game_map.pending.discard(room_name)
+                # current_room now refers to old temp Room object under wrong name; re-fetch
+                current_room = self.game_map.rooms.get(room_name) or current_room
+            if current_room.name != prev:
+                self.game_map.set_exit(prev, direction, current_room.name)
+                # Auto-record the reverse exit so BFS can place rooms correctly
+                opp = self.OPPOSITE_DIR.get(direction)
+                if opp and opp not in current_room.exits:
+                    self.game_map.set_exit(current_room.name, opp, prev)
+            # Always update here on movement so highlight follows player (even brief mode / same room)
+            self.game_map.here = current_room.name
         else:
             # No direction = explicit look/sync; always update here
             self.game_map.here = room_name
@@ -526,6 +722,33 @@ async def on_message(message: discord.Message):
         await message.channel.send(f"```\nSwitched to {game_name}. Restored from save if one exists.\n```")
         return
 
+    # >maptemp <query> – mark rooms matching query as temp-named (will be corrected on next visit)
+    if raw_cmd.startswith("maptemp "):
+        query = raw_cmd[8:].strip()
+        session = get_session(guild_id, channel_id)
+        if session is None:
+            await message.channel.send("No games available in ~/zmux-games/.")
+            return
+        renamed = session.game_map.mark_temp(query)
+        if renamed:
+            session._save_map()
+            lines = "\n".join(renamed)
+            await message.channel.send(f"```\nTemp-renamed:\n{lines}\n(will auto-correct on next visit)\n```")
+        else:
+            await message.channel.send(f"```\nNo rooms matching '{query}' found.\n```")
+        return
+
+    # >mapclear – wipe the entire map and start fresh
+    if raw_cmd == "mapclear":
+        session = get_session(guild_id, channel_id)
+        if session is None:
+            await message.channel.send("No games available in ~/zmux-games/.")
+            return
+        session.game_map = GameMap()
+        session._save_map()
+        await message.channel.send("```\nMap cleared.\n```")
+        return
+
     # >mapdel <query> – delete rooms matching query from the map
     if raw_cmd.startswith("mapdel "):
         query = raw_cmd[7:].strip()
@@ -547,7 +770,11 @@ async def on_message(message: discord.Message):
         if session is None:
             await message.channel.send("No games available in ~/zmux-games/.")
             return
-        await message.channel.send(f"```\n{session.game_map.to_ascii()}\n```")
+        img_bytes = session.game_map.to_image()
+        if img_bytes is None:
+            await message.channel.send("```\n(no map data yet)\n```")
+            return
+        await message.channel.send(file=discord.File(io.BytesIO(img_bytes), filename="map.png"))
         return
 
     # >new  – start a completely fresh game
@@ -645,8 +872,9 @@ async def on_message(message: discord.Message):
         session.kill()
         return
 
-    # Update map
-    session.update_map(game_out, direction)
+    # Update map — only on movement commands or explicit look
+    if direction or raw_cmd == "look":
+        session.update_map(game_out, direction)
 
     # Detect death (game offers Restart/Restore/Quit)
     upper_out = game_out.upper()
