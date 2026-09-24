@@ -29,10 +29,12 @@ INTENTS = discord.Intents.default()
 INTENTS.message_content = True
 CLIENT = discord.Client(intents=INTENTS)
 
-BASE_DIR = Path.home() / ".hermes" / "zmux-saves"
+_HERE = Path(__file__).resolve().parent
+
+BASE_DIR = _HERE / "saves"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-GAMES_DIR = Path.home() / "zmux-games"
+GAMES_DIR = _HERE / "games"
 GAMES_DIR.mkdir(parents=True, exist_ok=True)
 
 def list_games() -> dict[str, Path]:

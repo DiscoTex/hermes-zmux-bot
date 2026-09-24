@@ -19,7 +19,7 @@ This code was made entirely hands-off by a Hermes bot using various models.
 1. Install dfrotz: `sudo apt install frotz`
 2. Install Python deps: `pip install discord.py Pillow`
 3. Set `DISCORD_BOT_TOKEN` in your environment
-4. Drop Z-machine game files into `~/zmux-games/`
+4. Drop Z-machine game files into `games/`
 5. Run: `python3 zmux_bot.py`
 
 ## Commands
@@ -40,8 +40,10 @@ This code was made entirely hands-off by a Hermes bot using various models.
 
 ## File Layout
 
-- `~/zmux-games/` — game files (.z3, .z5, .z8, .zblorb)
-- `~/.hermes/zmux-saves/` — save files and map data (per guild, channel, game)
+All data lives inside the cloned repo directory:
+
+- `games/` — game files (.z3, .z5, .z8, .zblorb), drop them here
+- `saves/` — save files and map data (per guild, channel, game), auto-created
 
 ## Compatible Games
 
