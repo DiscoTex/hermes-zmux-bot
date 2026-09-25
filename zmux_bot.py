@@ -56,17 +56,6 @@ def dfrotz_cmd(game_path: Path) -> list[str]:
 
 PROMPT_RE = re.compile(r"(?m)^\s*>\s*$")
 
-# Detect "Exits:" / "Obvious exits:" lines in game output
-EXITS_LINE_RE = re.compile(
-    r"^(?:Obvious exits?|Exits?)\s*:\s*(.+?)\.?\s*$",
-    re.IGNORECASE | re.MULTILINE,
-)
-# Individual direction words inside the exits list
-DIR_WORD_RE = re.compile(
-    r"\b(north|south|east|west|northeast|northwest|southeast|southwest|up|down)\b",
-    re.IGNORECASE,
-)
-
 # ---------- MAPPER ----------
 class Room:
     def __init__(self, name: str, description: str):
@@ -327,7 +316,16 @@ class GameMap:
                 border = (255, 165, 0)
                 bw     = 2
             draw.rounded_rectangle([x0, y0, x1, y1], radius=7, fill=fill, outline=border, width=bw)
-            lbl = name if len(name) <= 14 else name[:13] + "…"
+            max_text_w = BOX_W - 10  # keep a small margin inside the box border
+            lbl = name
+            if draw.textbbox((0, 0), lbl, font=font)[2] > max_text_w:
+                for L in range(len(name), 0, -1):
+                    candidate = name[:L].rstrip() + "…"
+                    if draw.textbbox((0, 0), candidate, font=font)[2] <= max_text_w:
+                        lbl = candidate
+                        break
+                else:
+                    lbl = "…"
             bbox = draw.textbbox((0, 0), lbl, font=font)
             tw = bbox[2] - bbox[0]
             draw.text((cx - tw // 2, cy - 8), lbl, fill=TEXT_COL, font=font)
@@ -422,16 +420,22 @@ class GameSession:
             except Exception:
                 pass
 
-    async def start(self, restore: bool = True):
-        """Start dfrotz, optionally restoring from save."""
+    async def start(self, restore: bool = True) -> str:
+        """Start dfrotz, optionally restoring from save.
+
+        Returns the text that should be shown to the player: the game's
+        opening banner/room description for a fresh start, or the room
+        description after a successful restore.
+        """
         self.proc = await asyncio.create_subprocess_exec(
             *dfrotz_cmd(self.game_path),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
-        # Read startup banner / first prompt
-        await self._read_until_prompt(timeout=3.0)
+        # Read the game's intro text (banner + opening room description).
+        # This used to be discarded here, which is why players never saw it.
+        intro = await self._read_until_prompt(timeout=3.0)
 
         if restore:
             # Prefer the active named slot over the quicksave
@@ -449,6 +453,12 @@ class GameSession:
                 await self._send("look")
                 look_out = await self._read_until_prompt(timeout=3.0)
                 self.update_map(look_out, None)
+                return look_out.strip()
+
+        # Fresh game (no restore requested, or no save file found): show
+        # the actual game intro instead of throwing it away.
+        self.update_map(intro, None)
+        return intro.strip()
 
     async def _send(self, cmd: str):
         assert self.proc and self.proc.stdin
@@ -584,12 +594,38 @@ class GameSession:
                     name_line = ln
                     break
 
+        # When there's no movement direction (fresh game start, restore-sync,
+        # or an explicit "look"), the output can be preceded by title-art,
+        # engine banner, and story-flavor text before the real room
+        # description — this happens on the very first turn of a game. If
+        # the current candidate doesn't look like a genuine room title,
+        # search forward for the first ALL-CAPS line (the convention these
+        # games use for room headings) and use that instead, so the start
+        # room isn't recorded under a garbage name like "________________".
+        def _looks_like_title(s: str) -> bool:
+            letters = [c for c in s if c.isalpha()]
+            return len(letters) >= 3 and all(c.isupper() for c in letters)
+
+        if not direction and not _looks_like_title(name_line):
+            for ln in lines:
+                if _looks_like_title(ln):
+                    name_line = ln
+                    break
+
         # Normalize: "Dorm, in the bed" → "Dorm" (sub-location, not a new room)
         raw_name = name_line
         room_name = raw_name.split(",")[0].strip()
 
+        # Description is the first real line strictly after the chosen name
+        # line (not just lines[1], which would grab banner/art noise when
+        # name_line was found deeper in the output above).
         description = ""
-        for ln in lines[1:]:
+        past_name = False
+        for ln in lines:
+            if not past_name:
+                if ln == name_line:
+                    past_name = True
+                continue
             if ln and not ln.startswith(">"):
                 description = ln[:80]
                 break
@@ -720,8 +756,10 @@ async def on_message(message: discord.Message):
             await message.channel.send("No games available.")
             return
         session.game_map = GameMap()
-        await session.start(restore=True)
-        await message.channel.send(f"```\nSwitched to {game_name}. Restored from save if one exists.\n```")
+        intro = await session.start(restore=True)
+        if len(intro) > 1900:
+            intro = intro[:1900] + "\n...[truncated]..."
+        await message.channel.send(f"```\nSwitched to {game_name}.\n\n{intro}\n```")
         return
 
     # >maptemp <query> – mark rooms matching query as temp-named (will be corrected on next visit)
@@ -790,8 +828,10 @@ async def on_message(message: discord.Message):
             await message.channel.send("No games available in ~/zmux-games/.")
             return
         session.game_map = GameMap()
-        await session.start(restore=False)
-        await message.channel.send("```\nNew game started.\n```")
+        intro = await session.start(restore=False)
+        if len(intro) > 1900:
+            intro = intro[:1900] + "\n...[truncated]..."
+        await message.channel.send(f"```\n{intro}\n```")
         return
 
     # >load – restart and restore from quicksave
@@ -804,8 +844,10 @@ async def on_message(message: discord.Message):
         if session is None:
             await message.channel.send("No games available in ~/zmux-games/.")
             return
-        await session.start(restore=True)
-        await message.channel.send("```\nGame loaded from quicksave.\n```")
+        intro = await session.start(restore=True)
+        if len(intro) > 1900:
+            intro = intro[:1900] + "\n...[truncated]..."
+        await message.channel.send(f"```\n{intro}\n```")
         return
 
     # >load <slot> – load from a named save slot
@@ -857,8 +899,14 @@ async def on_message(message: discord.Message):
         return
 
     # Ensure process is running
+    lazy_intro = ""
     if session.proc is None or session.proc.returncode is not None:
-        await session.start(restore=True)
+        lazy_intro = await session.start(restore=True)
+    if lazy_intro:
+        intro_out = lazy_intro
+        if len(intro_out) > 1900:
+            intro_out = intro_out[:1900] + "\n...[truncated]..."
+        await message.channel.send(f"```\n{intro_out}\n```")
 
     # Figure out if this is a movement command
     direction = DIRECTION_ALIASES.get(raw_cmd)
@@ -874,13 +922,19 @@ async def on_message(message: discord.Message):
         session.kill()
         return
 
-    # Update map — only on movement commands or explicit look
-    if direction or raw_cmd == "look":
+    # Detect game-over (game offers Restart/Restore/Quit) BEFORE touching the
+    # map — death/win transitions print ASCII art or narrative text ahead of
+    # the room description, which would otherwise get recorded as a bogus
+    # room and pollute the persistent map file.
+    upper_out = game_out.upper()
+    is_game_over = "RESTART" in upper_out and "RESTORE" in upper_out and ("QUIT" in upper_out or "FULL" in upper_out)
+
+    # Update map — only on movement commands or explicit look, and never on
+    # the turn that ends the game.
+    if not is_game_over and (direction or raw_cmd == "look"):
         session.update_map(game_out, direction)
 
-    # Detect death (game offers Restart/Restore/Quit)
-    upper_out = game_out.upper()
-    if "RESTART" in upper_out and "RESTORE" in upper_out and ("QUIT" in upper_out or "FULL" in upper_out):
+    if is_game_over:
         slots = session.list_saves()
         slot_lines = "\n".join(
             f"  >load  (quicksave)" if s == "(quicksave)" else f"  >load {s}" for s in slots
